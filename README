@@ -1,0 +1,340 @@
+                           Fault Injection
+                           ===============
+
+Author:   Roman Penyaev <roman.penyaev@profitbricks.com>
+Author:   Roman Penyaev <r.peniaev@gmail.com>
+
+Introduction
+------------
+
+Fault injection is a framework which aims to help developers and testers
+to reproduce subtle bugs and to test thorougly error paths in the code.
+
+Firstly developer has to put special fault points in desired places all
+over the code, then those fault points can be configured in different
+ways and various faults can be injected.
+
+Currently fault injection supports three kind of faults: delays, errors
+and panics.
+
+Implementation Details
+----------------------
+
+Fault injection is based on jump labels, which means that big amount of
+fault points spread all over the code should not impact performance,
+because CPU will execute NOP if fault points are disabled.
+
+Fault points are statically compiled in and thus do not require memory
+allocation. Also, debugfs API is provided for flexible configuration
+from userspace.
+
+Generally speaking, fault point is a code branch which is executed only
+if fault point has been enabled. This code branch should be put by the
+developer and only she decides, according to the code logic, what should
+be executed if fault was injected. Let's take a real code example:
+
+        mem = kmalloc(len, GFP_KERNEL);
+        if (unlikely(!mem)) {
+            pr_err("%s: allocation failed\n", __func__);
+            return -ENOMEM;
+        }
+
+Here it will be interesting to introduce an error instead of calling
+kmalloc and to test an error path. Using fault injection framework it
+can be done like this:
+
+    +   #define kmalloc(...) \
+    +           (INJECT_FAULT() ? NULL : kmalloc(__VA_ARGS__))
+    +
+        mem = kmalloc(len, GFP_KERNEL);
+        if (unlikely(!mem)) {
+            pr_err("%s: allocation failed\n", __func__);
+            return -ENOMEM;
+        }
+
+If this fault point was configured to inject an error kmalloc will not
+be executed and an error will be returned from the macro.
+
+In the example above compiler will optimize INJECT_FAULT, and by default
+NOP will be executed followed.  When this fault point is configured to
+introduce an error, NOP instruction will be replaced with JMP instruction
+and slow path of the code will be executed.
+
+Internally fault point is represented as a static stateless entry compiled
+in __jump_table, so at any point of time we can list all the points,
+configure, enable or disable them.
+
+As was told, fault point is stateless, thus it does not know what kind
+offault it should inject, and that should be decided while doing
+configuration. That approach gives a lot of freedom to manipulate fault
+points and to configure them according to testing scenarios.
+
+
+Injecting faults in the code or macros API
+------------------------------------------
+
+Firstly fault injection must be registered by the module, in which
+it is supposed to be used:
+
+   static struct fault_inject inj;
+
+   fault_inject_register(&inj, THIS_MODULE);
+
+Fault injection framework provides three kinds of macros for fault
+injection:
+
+    o INJECT_FAULT -
+        Simplest one, returns an error if fault has been injected.
+
+    Code example:
+        +   err = INJECT_FAULT(&inj, "MEM");
+        +   if (unlikely(err))
+        +       return err;
+
+    o INJECT_FAULT_INT -
+        Accepts function parameter, which will be executed if fault was
+        not injected. In case of fault injection function will not be
+        executed and error as integer will be returned.
+
+    Code example:
+        -   err = do_useful_stuff(a, b, c);
+        +   err = INJECT_FAULT_INT(&inj, "DEV", do_useful_stuff(a, b, c));
+            if (unlikely(err))
+               return err;
+
+  o INJECT_FAULT_PTR -
+        This macro is almost the same as INJECT_FAULT_INT, but instead
+        of integer representation of an error pointer will be returned.
+        If error has happened it will be incapsulated inside a pointer.
+
+    Code example:
+        -   ptr = do_useful_stuff(a, b, c);
+        +   ptr = INJECT_FAULT_PTR(&inj, "DEV", do_useful_stuff(a, b, c));
+            if (unlikely(IS_ERR(ptr)))
+               return PTR_ERR(ptr);
+
+Second parameter for each INJECT_FAULT macro is a shost fault class
+name, which can be used for easy faults parsing.  In the example
+above two fault classes were created "MEM" and "DEV".
+
+As was told in introduction those fault points can introduce three kind
+of faults: delays, errors or panics. What faults should be raised is
+decided on the configuration stage.
+
+
+Configuration from userspace or debugfs API
+-------------------------------------------
+
+Each module has it's own fault injection configuration which is based on
+debugfs and is located here: /sys/kernel/debug/fault_inject/{MODULE_NAME}/.
+
+List of debugfs entries and their meaning:
+
+o list_fault_points [read only file]
+
+  Reading from this file outputs the whole list of compiled in fault
+  points, e.g. the output can be:
+
+  fault group class address            function+off/size file:line
+  ----- ----- ----  0xffffffffa068b0b4 init+0x0b4/0x5c6  main.c:2140
+  ----- ----- ----  0xffffffffa068b13a init+0x13a/0x5c6  main.c:2150
+  DE---     1 ----  0xffffffffa061234b exit+0x12a/0x33   main.c:342
+  -E---     2 ----  0xffffffffa042313c foo+0x124a/0x14a  main.c:11
+
+  'fault' column    - types of faults which are configured for this fault
+                      point, where D - delay, E - error, P - panic.
+  'group' column    - the group to which the fault point belongs, where
+                      '-----' means fault point does not belong to any
+                      group.
+  'class' column    - class of the fault.
+  'address' column  - address in the code where fault point is placed.
+  'function' column - function name, offset and the size where fault
+                      point is placed.
+  'file' column     - file and line of the current source file where
+                      fault point is placed. Keep in mind, that because
+                      of function inlining multiple different functions
+                      can have fault points with equal file name and line.
+
+  Reading from this file will give you explicit information about all
+  fault points for the module and their configuration, like to which
+  group it belongs or what kinds of faults are enabled right now.
+
+o create_group [write only file]
+
+  Writing some number to that file creates fault group with name corresponding
+  to the number you have written. Fault group is an abstraction which unites
+  variety of fault points which should be configured equally. So, basically
+  configration is performed for fault group, not for each fault point, but
+  fault group includes variety of fault points. E.g. you can use this command:
+
+  # echo 0 > ./create_group
+
+  If group already exists error will be returned.  In case of success
+  directory with group name will be created, i.e. 0/ in current example.
+
+  The maximum possible amount of groups are limited to 256.
+
+o next_group [read only file]
+
+  Reading from this file returns next free group number, e.g.
+
+  # cat ./next_group
+  1
+
+  That can be helpful to use from testing scripts in such command:
+
+  # cat ./next_group > ./create_group
+
+  Of course user should think about concurrent access.
+
+o delete_group [write only file]
+
+  Writing group number to that file removes specified group. If group does
+  not exist error will be returned.
+
+o {group_number}/ [directory]
+
+  Fault group directory which has configuration files for this group.
+
+o {group_number}/list_fault_points [read only file]
+
+  Reading from this file outputs the list of compiled in fault points
+  included to the current group. By default the list is empty and contains
+  the header only:
+
+  # cat ./list_fault_points
+  fault group class address            function+off/size file:line
+
+o {group_number}/add_fault_points [write only file]
+
+  Writing line with code address to that file will add fault point to this
+  group. Basic requirements are:
+
+   o line should have '\n' at the end
+   o the total length of the line should not exceed 127 chars, i.e. 126 + \n
+   o line should have any address in hex starting from 0x
+
+  For example:
+
+  # echo 0xffffffffa068b0b4 > ./add_fault_points
+
+  or more convenient way to add all fault points (please note that we
+  catting from 'list_fault_points' located in parent directory):
+
+  # cat ../list_fault_points > ./add_fault_points
+
+  or even filtering:
+
+  # cat ../list_fault_points | grep main.c > ./add_fault_points
+
+  If fault point already belongs to some group an error will be returned.
+  If address is parsed but does not exist an error will be returned.
+
+o {group_number}/del_fault_points [write only file]
+
+  Writing line with code address to that file will remove fault point
+  from that group. Basic requirements and restrictions are similar to
+  what is listed in in the description to add_fault_points file.
+
+  For example:
+
+  # cat ./list_fault_points | grep main.c | sponge ./del_fault_points
+
+  BEWARE: use 'sponge' to soak up all the input before writing to
+          del_fault_points, because in other case you will get an error.
+          Why? Keep in mind that you are reading the fault points from
+          the list and at the same time removing them from the same list.
+          'sponge' will help you!
+
+o {group_number}/delay/ [directory]
+
+  Directory with delay configuration for this group of fault points.
+
+   o delay_us [read write file, default value 0]
+
+    How many us of delay should be introduced if fault is injected.
+    Accepts integer value.
+
+o {group_number}/error/ [directory]
+
+  Directory with error configuration for this group of fault points.
+
+   o errors [read write file, default value is empty string]
+
+     Writing comma separate list of errors to that file will introduce
+     specified error on fault injection. Errors will be processed sequentially,
+     using round-robin pattern.
+
+     Reading from the file returns configured list of errors prefixed
+     with minuses.
+
+     For example writing:
+
+     # echo -ENOSPC,-EAGAIN > ./errors
+
+     or without minuses:
+
+     # echo ENOSPC,EAGAIN > ./errors
+
+     and reading them back:
+
+     # cat ./errors
+     -EAGAIN,-ENOSPC
+
+     In case of parsing failure error will be returned.
+
+o {group_number}/panic/ [directory]
+
+  Directory with panic configuration for this group of fault points.
+  If enabled and execution steps on fault point the kernel will panic.
+
+o Common files for delay/, error/ panic configurations:
+
+   o enable      [read write file, default value 0]
+
+    Writing 1 or 0 enables or disables respectively the configuration.
+    Reading from that file tells you if that configuration is enabled
+    or not.
+
+   o hits        [read only file, default value 0]
+
+    Statistics value which tells how many times that group of fault
+    points was hit. Keep in mind, that hitting does not mean fault
+    injection, because we have other parameters like probability,
+    interval or times.
+
+   o injected    [read only file, default value 0]
+
+    Statistics value which tells how many times that group of fault
+    points was really injected. So basically for group, which is
+    configured to delay, that means how many times executed fault points
+    was delayed, or for group, which was configured to introduce an error,
+    that means exactly how many times error was returned.
+
+   o times       [read write file, default value -1]
+
+    Specifies how many times failures may happen at most.
+    A value of -1 means "no limit".
+    Zero value is not accepted.
+
+   o probability [read write file, default value 100]
+
+    Likelihood of failure injection, in percent.
+    Accepted values are in the range [1, 100].
+
+    For example, if probability is set to 50 the ratio of hits and
+    injected should be close to 2.
+
+   o interval    [read write file, default value 1]
+
+    Specifies the interval between failures.
+    Zero value is not accepted.
+
+   o task_filter  [read write file, default value 0]
+
+    The default value is 0, which means filtering by task is disabled.
+    Any positive value limits failures to only processes indicated by
+    /proc/<pid>/make-it-fail==1.
+
+    NOTE: This option is available only if CONFIG_FAULT_INJECTION is
+          enabled for the kernel configuration.

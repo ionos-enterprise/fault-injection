@@ -1,0 +1,9 @@
+test_fault_inject.h
+Module.symvers
+modules.order
+.tmp_versions
+*~
+*.ko
+*.cmd
+*.mod.c
+*.o

@@ -1,0 +1,6 @@
+config FAULT_INJECTION2
+	tristate "Highly configurable fault-injection framework"
+	depends on DEBUG_KERNEL && JUMP_LABEL && X86
+	---help---
+	  Provide highly configurable fault-injection framework
+	  based on jump labels.  For more details, see README
